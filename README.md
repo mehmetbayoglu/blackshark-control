@@ -1,14 +1,24 @@
 # blackshark-control
 
-GTK4 control panel for the **Razer BlackShark V3** headset on Linux. Controls the openrazer `razerkraken` driver's sysfs attributes — headphone EQ (5 profile slots, 10 bands), mic EQ with 4 presets, sidetone, and the audio function button mode.
+GTK4 control panel for the **Razer BlackShark V3 / V3 Pro** headset on Linux. It
+drives the openrazer `razerkraken` driver's sysfs attributes: headphone EQ
+(9 slots, 10 bands), mic EQ with 4 presets, sidetone, game/chat balance, in-call
+mix, audio prompts, THX, ANC (V3 Pro), and the audio function button mode.
 
-Supports both PIDs:
-- `1532:0579` (wired USB)
-- `1532:057a` (2.4GHz dongle)
+It also **reflects on-board changes live**: turn the dial, press the EQ button,
+flip the mic boom, and so on, and the matching control in the app updates within
+about a second (the driver caches the headset's own pushes, the app polls that
+cache). Battery is shown when the headset reports it.
+
+Supported PIDs:
+- `1532:0579` (V3 wired) and `1532:057a` (V3 2.4 GHz dongle)
+- `1532:0576` (V3 Pro wired) and `1532:0577` (V3 Pro 2.4 GHz dongle)
 
 ## Requirements
 
-- Linux with the openrazer kernel module that supports the BlackShark V3 (PR [openrazer/openrazer#2784](https://github.com/openrazer/openrazer/pull/2784) or later)
+- Linux with an openrazer `razerkraken` build that supports the BlackShark V3
+  (PR [openrazer/openrazer#2794](https://github.com/openrazer/openrazer/pull/2794)
+  or later)
 - Python 3.9+, GTK 4, PyGObject
 - User in the `openrazer` group (added automatically when installing `openrazer-meta`)
 
@@ -64,18 +74,41 @@ Launch from your application menu (entry: **BlackShark V3 Control**) or run:
 blackshark-control
 ```
 
-The status bar shows the detected device PID. If it says "Device not found", the driver isn't loaded or the device isn't bound — see the openrazer fork's setup notes.
+If you're running from a git checkout rather than an install, run the file
+directly so you get the checked-out version:
+
+```sh
+python3 blackshark_control/app.py
+```
+
+The status bar shows the detected device PID and battery. If it says "Device not
+found", the driver isn't loaded or the device isn't bound.
 
 ### Tabs
 
-- **Sound** — THX toggle, 5-slot headphone EQ (Default / Game / Movie / Music / Esports), 10-band sliders with auto-apply, "Reset to Default Values" button
-- **Enhancement** — Ultra-Low Latency toggle (currently uses an unverified command byte)
-- **Mic** — Sidetone slider (0–15), Mic EQ presets, 10-band Mic EQ sliders with reset, audio function button mode (Sidetone Save / Footsteps Scaling)
-- **Power** — Wireless power save + timeout (currently uses an unverified command byte)
+- **Sound** — THX toggle; headphone EQ with 9 slots (Default / Game / Movie /
+  Music / Esports, plus Custom 1-4); 10-band sliders with auto-apply; a
+  "Write to" slot selector; "Reset to Default Values".
+- **Enhancement** — Ultra-Low Latency (wireless), ANC + Ambient with level
+  (V3 Pro), Game/Chat balance slider, In-call audio mix.
+- **Mic** — Sidetone slider (0-15), Mic EQ presets (Default / Esports /
+  Broadcast / MicBoost), 10-band Mic EQ sliders with reset, audio function
+  button mode, audio prompts toggle.
+- **Power** — Wireless power-save timeout.
 
-Mic volume is **not** controlled here — it's standard USB Audio Class 2, use `pavucontrol` / your normal audio mixer.
+Mic volume is **not** controlled here: it's standard USB Audio Class 2, so use
+`pavucontrol` or your normal audio mixer.
 
 Per-slot custom EQ values persist in `~/.config/blackshark-control.json`.
+
+## Notes on battery
+
+Battery/charging show the value the headset last **pushed**; the app never polls
+the device for it. On the plain V3 the firmware answers a battery query only once
+per reconnect and drops the RF link on repeats, so polling it would reset the
+dongle. As a result the plain-V3 battery figure updates only when the headset
+sends a new value (when the percentage actually changes), not continuously. The
+V3 Pro reports battery continuously via its telemetry channel.
 
 ## License
 
