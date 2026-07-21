@@ -76,13 +76,22 @@ DEVICE_CAPS['0576'].update({
 EQ_FREQS = ['31Hz','63Hz','125Hz','250Hz','500Hz','1kHz','2kHz','4kHz','8kHz','16kHz']
 
 EQ_PRESETS = {
-    'Default': [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
-    'Game':    [ 2,  2, -3, -3,  1, -1,  2,  3,  3,  3],
-    'Movie':   [ 3,  3,  4,  0, -4, -4,  2,  3,  3,  3],
-    'Music':   [ 6,  3,  4,  3,  0,  0,  0,  1,  3,  4],
-    'Esports': [ 1,  1, -1,  0,  2,  0,  4,  4,  4, -3],
+    'Default':  [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    'Game':     [ 2,  2, -3, -3,  1, -1,  2,  3,  3,  3],
+    'Movie':    [ 3,  3,  4,  0, -4, -4,  2,  3,  3,  3],
+    'Music':    [ 6,  3,  4,  3,  0,  0,  0,  1,  3,  4],
+    'Esports':  [ 1,  1, -1,  0,  2,  0,  4,  4,  4, -3],
+    # Firmware slots 5..8 are user-writable. They start flat; whatever you
+    # dial in and Apply gets saved back to that slot.
+    'Custom 1': [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    'Custom 2': [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    'Custom 3': [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    'Custom 4': [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
 }
-PRESET_IDX = {'Default': 0, 'Game': 1, 'Movie': 2, 'Music': 3, 'Esports': 4}
+PRESET_IDX = {'Default': 0, 'Game': 1, 'Movie': 2, 'Music': 3, 'Esports': 4,
+              'Custom 1': 5, 'Custom 2': 6, 'Custom 3': 7, 'Custom 4': 8}
+# Slot label per firmware EQ index, in order (0..8).
+PROFILE_NAMES = [n for n, _ in sorted(PRESET_IDX.items(), key=lambda kv: kv[1])]
 
 MIC_EQ_PRESETS = ['Default', 'Esports', 'Broadcast', 'MicBoost']
 # Synthetic factory values (Synapse doesn't send mic EQ band data with preset cmds)
@@ -112,7 +121,7 @@ def _write_config(data):
 
 def load_eq_config():
     saved = {int(k): v for k, v in _read_config().get('eq_custom', {}).items()}
-    for idx in range(5):
+    for idx in EQ_FACTORY:
         if idx not in saved:
             saved[idx] = list(EQ_FACTORY[idx])
     return saved
@@ -288,6 +297,11 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         self._connected_pid = self._device.pid if self._device else None
         self._mic_vol_slider = None
         self._ignore_slider = False
+        # When True, a widget is being updated programmatically to mirror an
+        # on-board (headset button) change — its own change handler must NOT
+        # write the value back to the device (that would be a feedback loop).
+        self._syncing = False
+        self._sync_inflight = False
 
         # Seed UI state from JSON cache → defaults. Skip sysfs reads at startup
         # because some attrs (thx, ull, battery on V3 wireless) issue blocking
@@ -322,6 +336,10 @@ class BlackSharkControl(Gtk.ApplicationWindow):
 
         # status refresh
         GLib.timeout_add(2000, self._refresh_status)
+        # live sync: reflect on-board (headset button) changes in the UI.
+        # Polls only the driver's cached attrs (no device query → no blocking),
+        # so it's safe to run frequently on the wireless link.
+        GLib.timeout_add(700, self._live_sync)
 
         nb = Gtk.Notebook()
         nb.set_tab_pos(Gtk.PositionType.TOP)
@@ -355,13 +373,28 @@ class BlackSharkControl(Gtk.ApplicationWindow):
     def _has(self, feature):
         return self._device is not None and self._device.has(feature)
 
-    def _write(self, feature, value):
+    def _write_sync(self, feature, value):
+        """Blocking sysfs write. ONLY use from worker threads — sysfs writes
+        can take >1 s when the driver send path waits for an int-IN reply
+        the V3 wireless firmware never delivers."""
         if not self._device:
             return False, 'device not found'
         return self._device.write(feature, value)
 
-    # Back-compat alias for callers that explicitly want sync semantics.
-    _write_sync = _write
+    def _write(self, feature, value, on_done=None):
+        """Non-blocking sysfs write — runs on a daemon thread so the GTK main
+        thread never freezes. Most handlers don't need the result; pass
+        on_done(ok, err) if you do (callback fires via GLib.idle_add)."""
+        if not self._device:
+            if on_done:
+                GLib.idle_add(lambda: (on_done(False, 'device not found'), False)[1])
+            return
+        import threading
+        def _worker():
+            ok, err = self._device.write(feature, value)
+            if on_done:
+                GLib.idle_add(lambda: (on_done(ok, err), False)[1])
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _read(self, feature):
         return self._device.read(feature) if self._device else None
@@ -425,10 +458,11 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         # Bail if device disconnected/replaced while the worker was running.
         if self._device is None or self._device is not dev:
             return False
-        # Local-only clean format (not pushed to github — main keeps raw=N
-        # for Joe's debug). Same as pre-today commit 6f6ad6d.
+        # Local-only: drop the bl != '-1' filter so we always show whatever
+        # the driver reports, even when it's -1. Helps see if anything is
+        # ever returning real data on V3 wireless.
         extras = ''
-        if bl and bl != '-1':
+        if bl:
             try:
                 pct = round(int(bl) / 255 * 100)
                 extras = f' · battery {pct}%'
@@ -440,6 +474,111 @@ class BlackSharkControl(Gtk.ApplicationWindow):
             f'{dev.name} · {dev.pid} · {os.path.basename(dev.path)}{extras}'
         )
         return False  # one-shot
+
+    # ── live sync (on-board button changes → UI) ─────────────────────────────
+
+    # Only cache-backed attrs are polled here. Reading these returns the value
+    # the driver's raw_event cached from the headset's spontaneous pushes — no
+    # HID command is sent, so it never disturbs the wireless link. thx/ull/
+    # battery are intentionally excluded: reading them issues a blocking GET.
+    _SYNC_FEATURES = ('sidetone', 'game_chat', 'in_call_mix', 'audio_fn_button',
+                      'audio_prompts', 'mic_eq_preset', 'eq')
+
+    @staticmethod
+    def _sync_int(raw):
+        """First token of a sysfs value as int, or None if unset ('-1')/garbage."""
+        if raw is None:
+            return None
+        tok = raw.split()
+        if not tok:
+            return None
+        try:
+            v = int(tok[0])
+        except ValueError:
+            return None
+        return None if v < 0 else v
+
+    def _live_sync(self):
+        if not self._device or self._sync_inflight:
+            return True
+        self._sync_inflight = True
+        dev = self._device
+        def _worker():
+            vals = {f: dev.read(f) for f in self._SYNC_FEATURES if dev.has(f)}
+            GLib.idle_add(self._apply_live_sync, dev, vals)
+        threading.Thread(target=_worker, daemon=True).start()
+        return True   # keep timer running
+
+    def _apply_live_sync(self, dev, vals):
+        self._sync_inflight = False
+        if self._device is not dev:
+            return False
+        self._syncing = True
+        try:
+            v = self._sync_int(vals.get('sidetone'))
+            if v is not None and getattr(self, '_sidetone_slider', None) and v != self._sidetone_level:
+                self._sidetone_level = v
+                self._sidetone_slider.set_value(v)
+
+            v = self._sync_int(vals.get('game_chat'))
+            if v is not None and getattr(self, '_gc_slider', None) and v != self._gc_balance:
+                self._gc_balance = v
+                self._gc_slider.set_value(v)
+
+            v = self._sync_int(vals.get('in_call_mix'))
+            if v is not None and v != self._in_call_mix and v in getattr(self, '_ic_btns', {}):
+                self._in_call_mix = v
+                for b in self._ic_btns.values():
+                    b.remove_css_class('active')
+                self._ic_btns[v].add_css_class('active')
+
+            v = self._sync_int(vals.get('audio_fn_button'))
+            if v is not None and v != self._fn_mode and v in getattr(self, '_fn_btns', {}):
+                self._fn_mode = v
+                for b in self._fn_btns.values():
+                    b.remove_css_class('active')
+                self._fn_btns[v].add_css_class('active')
+
+            v = self._sync_int(vals.get('audio_prompts'))
+            if v is not None and getattr(self, '_ap_btn', None) and (v == 1) != self._audio_prompts:
+                self._audio_prompts = (v == 1)
+                self._ap_btn.set_label('ON' if self._audio_prompts else 'OFF')
+                self._ap_btn.remove_css_class('toggle-off' if self._audio_prompts else 'toggle-on')
+                self._ap_btn.add_css_class('toggle-on' if self._audio_prompts else 'toggle-off')
+
+            v = self._sync_int(vals.get('mic_eq_preset'))
+            if v is not None and v != self._mic_target_idx and v in getattr(self, '_mic_preset_btns', {}):
+                self._sync_mic_preset(v)
+
+            v = self._sync_int(vals.get('eq'))
+            if v is not None and v != self._eq_target_profile:
+                self._sync_eq_preset(v)
+        finally:
+            self._syncing = False
+        return False   # one-shot (idle_add)
+
+    def _sync_eq_preset(self, idx):
+        """Mirror an on-board headphone-EQ preset switch. Highlights the preset
+        and loads its bands into the sliders WITHOUT writing back to the device."""
+        name = next((n for n, i in PRESET_IDX.items() if i == idx), None)
+        if name is None:
+            return   # custom slot with no preset button — nothing to highlight
+        for b in self._preset_btns.values():
+            b.remove_css_class('active')
+        self._preset_btns[name].add_css_class('active')
+        self._eq_target_profile = idx
+        self._eq_preset_cleared = False
+        self._update_profile_selector()
+        self._load_sliders(self._eq_custom.get(idx, list(EQ_FACTORY[idx])))
+        self._update_hex_preview()
+
+    def _sync_mic_preset(self, idx):
+        """Mirror an on-board mic-EQ preset switch (highlight + load bands)."""
+        for b in self._mic_preset_btns.values():
+            b.remove_css_class('active')
+        self._mic_preset_btns[idx].add_css_class('active')
+        self._mic_target_idx = idx
+        self._load_mic_sliders(self._mic_eq_custom.get(idx, list(MIC_EQ_FACTORY[idx])))
 
     # ── Sound tab ───────────────────────────────────────────────────────────
 
@@ -599,6 +738,11 @@ class BlackSharkControl(Gtk.ApplicationWindow):
 
         right.append(eq_card)
 
+        # Render the initial hex preview now that the label exists — otherwise
+        # the placeholder "hex: (not connected)" stays visible until the user
+        # clicks a preset or moves a slider.
+        self._update_hex_preview()
+
         return outer
 
     def _on_thx_toggle(self, btn):
@@ -614,6 +758,14 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         self._write('thx', '1' if self._thx_on else '0')
 
     def _on_preset(self, btn, name):
+        # Cancel any pending debounce timer SYNCHRONOUSLY — before we change
+        # _eq_target_profile, so a stale slider-drag debounce can't fire with
+        # the new profile but old band values (which would write Game's bands
+        # to slot 2 when switching Game → Movie).
+        if self._eq_apply_timer:
+            GLib.source_remove(self._eq_apply_timer)
+            self._eq_apply_timer = None
+
         # Update button highlight first and let GTK paint it before doing
         # anything else — the slider-load + sysfs-write takes long enough
         # that without the deferral the previous preset's green styling
@@ -622,14 +774,13 @@ class BlackSharkControl(Gtk.ApplicationWindow):
             b.remove_css_class('active')
         btn.add_css_class('active')
         self._eq_target_profile = PRESET_IDX[name]
+        self._eq_preset_cleared = False  # reset for next drag
         self._update_profile_selector()
 
         def _finish_preset_change():
             vals = self._eq_custom.get(self._eq_target_profile,
                                        list(EQ_FACTORY[self._eq_target_profile]))
             self._load_sliders(vals)
-            if self._eq_apply_timer:
-                GLib.source_remove(self._eq_apply_timer)
             self._eq_apply_timer = GLib.timeout_add(50, self._debounced_apply)
             return False
 
@@ -654,11 +805,26 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         if self._ignore_slider:
             return
         v = int(round(sl.get_value()))
+        if self._eq_values[idx] == v:
+            # value-changed fires on every sub-pixel; skip if int value unchanged
+            return
         self._eq_values[idx] = v
         self._eq_val_labels[idx].set_text(f'{v:+d}' if v != 0 else '0')
-        for b in self._preset_btns.values():
-            b.remove_css_class('active')
-        self._update_hex_preview()
+        # Clear preset highlights only the FIRST time during a drag —
+        # iterating + removing css class on 5 buttons triggers re-layout
+        # and adds visible lag when fired hundreds of times per second.
+        if not getattr(self, '_eq_preset_cleared', False):
+            for b in self._preset_btns.values():
+                b.remove_css_class('active')
+            self._eq_preset_cleared = True
+        # Coalesce hex preview updates — let GTK redraw at its own rate.
+        if not getattr(self, '_eq_hex_pending', False):
+            self._eq_hex_pending = True
+            def _redraw():
+                self._eq_hex_pending = False
+                self._update_hex_preview()
+                return False
+            GLib.idle_add(_redraw)
         if self._eq_apply_timer:
             GLib.source_remove(self._eq_apply_timer)
         self._eq_apply_timer = GLib.timeout_add(300, self._debounced_apply)
@@ -685,8 +851,8 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         buf[62] = crc
         hex_str = ' '.join(f'{b:02x}' for b in buf[:24]) + ' ...'
         sysfs_cmd = f"{self._eq_target_profile} " + ' '.join(str(v) for v in self._eq_values)
-        profile_names = ['Default', 'Game', 'Movie', 'Music', 'Esports']
-        pname = profile_names[self._eq_target_profile]
+        idx = self._eq_target_profile
+        pname = PROFILE_NAMES[idx] if 0 <= idx < len(PROFILE_NAMES) else f'slot {idx}'
         lines = [
             f'0x95 cmd (profile={self._eq_target_profile} {pname}): {hex_str}',
             f'bands[0..9]: {" ".join(str(v) for v in self._eq_values)}',
@@ -743,8 +909,7 @@ class BlackSharkControl(Gtk.ApplicationWindow):
             profile_idx = self._eq_target_profile
         val_str = f"{profile_idx} " + ' '.join(str(v) for v in self._eq_values)
         snapshot_vals = list(self._eq_values)
-        profile_names = ['Default', 'Game', 'Movie', 'Music', 'Esports']
-        pname = profile_names[profile_idx]
+        pname = PROFILE_NAMES[profile_idx] if 0 <= profile_idx < len(PROFILE_NAMES) else f'slot {profile_idx}'
 
         # Run the sysfs write on a worker thread — the driver's 5-step HID
         # sequence blocks the caller for ~750ms (4 inter-write msleep(150)).
@@ -899,6 +1064,8 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         self._write('ull', '1' if self._ull_on else '0')
 
     def _on_game_chat_balance(self, sl):
+        if self._syncing:
+            return   # mirroring an on-board change — don't echo it back
         val = int(round(sl.get_value()))
         self._write('game_chat', str(val))
 
@@ -1107,6 +1274,8 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         self._write('audio_prompts', '1' if self._audio_prompts else '0')
 
     def _on_sidetone(self, sl):
+        if self._syncing:
+            return   # mirroring an on-board change — don't echo it back
         val = int(round(sl.get_value()))
         self._write('sidetone', str(val))
 
@@ -1122,15 +1291,13 @@ class BlackSharkControl(Gtk.ApplicationWindow):
     def _apply_mic_eq(self, idx=None):
         if idx is None:
             idx = self._mic_target_idx
-        ok, err = self._write('mic_eq', ' '.join(str(v) for v in self._mic_eq_values))
-        if ok:
-            self._mic_eq_custom[idx] = list(self._mic_eq_values)
-            save_mic_eq_config(self._mic_eq_custom)
-            status = f'→ Written to mic preset {idx}'
-        else:
-            status = f'→ Write failed: {err}'
+        # Optimistically update local state + status; sysfs writes happen on
+        # worker threads so the GTK main thread doesn't freeze.
+        self._mic_eq_custom[idx] = list(self._mic_eq_values)
+        save_mic_eq_config(self._mic_eq_custom)
+        self._write('mic_eq', ' '.join(str(v) for v in self._mic_eq_values))
         self._write('mic_eq_preset', str(idx))
-        self._update_mic_hex_preview(status=status)
+        self._update_mic_hex_preview(status=f'→ Written to mic preset {idx}')
 
     def _on_mic_preset(self, btn, idx):
         for b in self._mic_preset_btns.values():
@@ -1146,9 +1313,18 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         if self._mic_ignore_slider:
             return
         v = int(round(sl.get_value()))
+        if self._mic_eq_values[idx] == v:
+            return
         self._mic_eq_values[idx] = v
         self._mic_eq_val_labels[idx].set_text(f'{v:+d}' if v != 0 else '0')
-        self._update_mic_hex_preview()
+        # Coalesce hex preview redraws to one per idle tick
+        if not getattr(self, '_mic_hex_pending', False):
+            self._mic_hex_pending = True
+            def _redraw():
+                self._mic_hex_pending = False
+                self._update_mic_hex_preview()
+                return False
+            GLib.idle_add(_redraw)
         if self._mic_eq_apply_timer:
             GLib.source_remove(self._mic_eq_apply_timer)
         self._mic_eq_apply_timer = GLib.timeout_add(300, self._mic_eq_debounced_apply)
