@@ -319,6 +319,11 @@ class BlackSharkControl(Gtk.ApplicationWindow):
         eq_state = (self._device.state.get('eq', '') if self._device else '').split()
         try: self._eq_target_profile = int(eq_state[0]) if eq_state else 0
         except ValueError: self._eq_target_profile = 0
+        # Last active-preset value the *device* reported. Live-sync only moves
+        # the green highlight when this actually changes (a real on-headset
+        # switch), so clicking a profile in the GUI isn't reverted a poll later
+        # by the device still reporting the previous active slot.
+        self._last_eq_device_preset = -1
         # Power-save timeout in minutes. 0 = "Never sleep" (a valid choice, not
         # disabled state — the toggle was UX bloat that conflated this).
         self._pwr_timeout = _int('power_save', 30)
@@ -551,8 +556,12 @@ class BlackSharkControl(Gtk.ApplicationWindow):
                 self._sync_mic_preset(v)
 
             v = self._sync_int(vals.get('eq'))
-            if v is not None and v != self._eq_target_profile:
-                self._sync_eq_preset(v)
+            if v is not None and v != self._last_eq_device_preset:
+                # Only react to a genuine device-side change, not to the device
+                # echoing back the slot we just wrote.
+                self._last_eq_device_preset = v
+                if v != self._eq_target_profile:
+                    self._sync_eq_preset(v)
         finally:
             self._syncing = False
         return False   # one-shot (idle_add)
